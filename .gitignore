@@ -1,0 +1,5 @@
+# Compiled binary
+gx
+
+# Temp scripts (session-scoped, not committed)
+.sh-tmp/

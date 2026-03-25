@@ -1,0 +1,83 @@
+#!/bin/bash
+# it2 shim — wraps gx for Claude Code ITermBackend compatibility
+# Translates it2 CLI commands to gx equivalents for Ghostty native teammates.
+
+GX="${GX_BIN:-gx}"
+command -v "$GX" >/dev/null 2>&1 || { echo "it2 shim: gx not found on PATH" >&2; exit 127; }
+
+# UUID pattern (case-insensitive)
+is_uuid() { [[ "$1" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; }
+
+case "$1" in
+  session)
+    case "$2" in
+      list)
+        # Claude Code checks exit code 0 = backend available
+        output=$($GX --all list 2>/dev/null)
+        rc=$?
+        if [ $rc -ne 0 ]; then exit $rc; fi
+        echo "$output" | while IFS=$'\t' read -r idx active title uuid; do
+          [[ "$idx" =~ ^── ]] && continue
+          [[ -z "$idx" ]] && continue
+          [ -n "$uuid" ] && echo "$uuid"
+        done
+        exit 0
+        ;;
+      split)
+        shift 2
+        direction="-h"
+        target=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            -v) direction="-v" ;;
+            -s) shift; target="$1" ;;
+          esac
+          shift
+        done
+        if [[ -z "$target" ]]; then
+          target="focused"
+        elif ! is_uuid "$target"; then
+          # Not a UUID (e.g., fake leader ID) — resolve to focused
+          target="focused"
+        fi
+        $GX split "$target" "$direction"
+        ;;
+      run)
+        shift 2
+        target=""
+        if [[ "$1" == "-s" ]]; then
+          shift; target="$1"; shift
+        fi
+        cmd="$*"
+        if [[ -n "$target" ]]; then
+          $GX send "$target" "$cmd"
+        else
+          $GX send focused "$cmd"
+        fi
+        ;;
+      close)
+        shift 2
+        target=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            -f) ;; # force flag — ignored, always force
+            -s) shift; target="$1" ;;
+          esac
+          shift
+        done
+        if [[ -n "$target" ]]; then
+          $GX close "$target" 2>/dev/null
+        fi
+        exit 0  # idempotent — always succeed (pane may already be gone)
+        ;;
+      *)
+        echo "it2 shim: unknown session subcommand '$2'" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    echo "it2 shim: unknown command '$1'" >&2
+    exit 1
+    ;;
+esac
