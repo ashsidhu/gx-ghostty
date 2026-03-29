@@ -1,0 +1,51 @@
+name: Release Universal Binary
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag or release tag to upload the gx binary to
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: macos-14
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      CLANG_MODULE_CACHE_PATH: ${{ runner.temp }}/clang-module-cache
+      SWIFT_MODULECACHE_PATH: ${{ runner.temp }}/swift-module-cache
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Prepare build cache directories
+        run: mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULECACHE_PATH"
+
+      - name: Build arm64 binary
+        run: swiftc -O gx.swift -o gx-arm64 -framework Cocoa -target arm64-apple-macos14.0
+
+      - name: Build x86_64 binary
+        run: swiftc -O gx.swift -o gx-x86_64 -framework Cocoa -target x86_64-apple-macos14.0
+
+      - name: Create universal binary
+        run: |
+          lipo -create -output gx gx-arm64 gx-x86_64
+          chmod +x gx
+          lipo -info gx
+          file gx
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: gx
+          overwrite_files: true
