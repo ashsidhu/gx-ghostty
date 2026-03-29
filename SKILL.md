@@ -1,8 +1,15 @@
+---
+name: gx
+description: Use when interacting with Ghostty terminals — listing, peeking, sending text, managing windows/tabs/splits, or controlling Claude Code teammates
+---
+
 # gx — Ghostty Terminal Control
 
 Thinnest possible scripting layer on top of Ghostty. Exists to close the loop until Ghostty ships these primitives natively.
 
-Version: 1.3.0
+Version: 1.3.1
+Source: `~/scratch/gx/gx.swift`
+Binary: `~/.local/bin/gx` → `~/scratch/gx/gx`
 Requires: Accessibility permission + Ghostty 1.3+
 
 ## Build
@@ -117,7 +124,7 @@ input text "cmd" to terminal id "UUID"           -- send
 send key "enter" to terminal id "UUID"            -- send
 split terminal id "UUID" direction right          -- split
 close terminal id "UUID"                          -- close
-get id of every terminal of selected tab of w     -- list
+get id of every terminal of every tab of w         -- list (all tabs)
 
 -- Available but NOT yet used
 send key "c" modifiers "control" to terminal id "UUID"  -- would replace withFocus for key/approve/deny

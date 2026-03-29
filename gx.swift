@@ -95,30 +95,40 @@ private func asListTerminals() -> [(uuid: String, name: String)] {
 /// Get all windows' terminal UUIDs, grouped by window, in order.
 /// Returns array of arrays: [[window0_terminals], [window1_terminals], ...]
 /// No title matching — pure ordinal, avoids spinner/focus title-shift issues.
-private func asAllWindowTerminals() -> [[String]] {
+/// Returns [(windowName, [terminalUUIDs])] — one entry per window, terminals across ALL tabs.
+private func asAllWindowTerminals() -> [(name: String, uuids: [String])] {
     guard let result = runAS("""
         tell application "Ghostty"
             set output to ""
             repeat with w in every window
-                set termIds to id of every terminal of selected tab of w
-                repeat with i from 1 to count of termIds
-                    set output to output & item i of termIds
-                    if i < count of termIds then set output to output & ","
+                set wName to name of w
+                set output to output & wName & "\\t"
+                set allTerms to {}
+                repeat with t in every tab of w
+                    set allTerms to allTerms & (id of every terminal of t)
                 end repeat
-                set output to output & ";"
+                repeat with i from 1 to count of allTerms
+                    set output to output & item i of allTerms
+                    if i < count of allTerms then set output to output & ","
+                end repeat
+                set output to output & "\\n"
             end repeat
             return output
         end tell
     """), !result.isEmpty else { return [] }
 
-    // Parse "uuid1,uuid2;uuid3;..." into [[String]]
-    return result.components(separatedBy: ";")
+    // Parse "windowName\tuuid1,uuid2\nwindowName2\tuuid3\n..." into [(name, [uuid])]
+    return result.components(separatedBy: "\n")
         .filter { !$0.isEmpty }
-        .map { $0.components(separatedBy: ",") }
+        .compactMap { line in
+            let parts = line.components(separatedBy: "\t")
+            guard parts.count == 2, !parts[1].isEmpty else { return nil }
+            return (name: parts[0], uuids: parts[1].components(separatedBy: ","))
+        }
 }
 
-/// Get terminal UUIDs for a specific window's selected tab, in order.
-/// Returns UUIDs in the same order AS enumerates them (should match AX pane order).
+/// Get terminal UUIDs for a specific window across all tabs, in order.
+/// Returns UUIDs in the same order AS enumerates them (should match AX surface order).
 private func asTerminalsForWindow(title: String) -> [String] {
     // Strip leading spinner/braille chars for stable matching — spinners rotate between
     // AX enumeration and AS enumeration, causing exact match to fail
@@ -132,7 +142,16 @@ private func asTerminalsForWindow(title: String) -> [String] {
         tell application "Ghostty"
             repeat with w in every window
                 if name of w contains "\(escaped)" then
-                    return id of every terminal of selected tab of w
+                    set allTerms to {}
+                    repeat with t in every tab of w
+                        set allTerms to allTerms & (id of every terminal of t)
+                    end repeat
+                    set output to ""
+                    repeat with i from 1 to count of allTerms
+                        set output to output & item i of allTerms
+                        if i < count of allTerms then set output to output & ","
+                    end repeat
+                    return output
                 end if
             end repeat
             return ""
@@ -140,7 +159,7 @@ private func asTerminalsForWindow(title: String) -> [String] {
     """), !result.isEmpty else {
         return []
     }
-    return result.components(separatedBy: ", ")
+    return result.components(separatedBy: ",")
 }
 
 /// Send text to a terminal by UUID via AppleScript. No clipboard, no focus raise.
@@ -189,7 +208,7 @@ private func asFocusedTerminalUUID() -> String? {
 
 /// Get all terminal UUIDs as a flat set.
 private func asAllTerminalUUIDs() -> Set<String> {
-    return Set(asAllWindowTerminals().flatMap { $0 })
+    return Set(asAllWindowTerminals().flatMap { $0.uuids })
 }
 
 /// Detect a newly created terminal by diffing UUIDs before and after a window-creation action.
@@ -508,7 +527,10 @@ private func resolveUUID(_ uuid: String, pid: pid_t, surfaces: [Surface]) -> Sur
             set wIdx to 0
             repeat with w in every window
                 set wIdx to wIdx + 1
-                set tIds to id of every terminal of selected tab of w
+                set tIds to {}
+                repeat with t in every tab of w
+                    set tIds to tIds & (id of every terminal of t)
+                end repeat
                 repeat with i from 1 to count of tIds
                     if item i of tIds is "\(uuid)" then
                         return (wIdx as text) & ":" & (i as text) & ":" & ((count of tIds) as text)
@@ -824,36 +846,71 @@ private func applyRange(_ lines: [String], _ range: PeekRange) -> ArraySlice<Str
 
 // MARK: - UUID Resolution
 
-/// Build a map from surface index → terminal UUID using AX/AS window-order correlation.
+/// Strip leading spinner/braille chars for stable title matching.
+/// Spinners rotate between AX and AS enumeration, so exact prefix match fails.
+private func stableWindowTitle(_ title: String) -> String {
+    String(title.drop(while: { !$0.isASCII || $0.isWhitespace }).drop(while: { $0.isWhitespace }))
+}
+
+/// Build a map from surface index → terminal UUID using window-name correlation.
+/// Matches AX windows to AS windows by title (stripping spinner prefixes),
+/// then assigns UUIDs by surface order within each window.
 private func buildUUIDMap(surfaces: [Surface]) -> [Int: String] {
     let asWindows = asAllWindowTerminals()
 
+    // Group surfaces by windowIndex
     var windowSurfaces: [Int: [Surface]] = [:]
     for s in surfaces { windowSurfaces[s.windowIndex, default: []].append(s) }
-    let sortedWinKeys = windowSurfaces.keys.sorted()
+
+    // Get the AX window title for each window group (from the first surface or the window element)
+    var windowTitles: [Int: String] = [:]
+    for (winIdx, winSurfaces) in windowSurfaces {
+        if let firstSurface = winSurfaces.first {
+            let axTitle: String = ax(firstSurface.window, kAXTitleAttribute as String) ?? ""
+            windowTitles[winIdx] = axTitle
+        }
+    }
 
     var uuidMap: [Int: String] = [:]
-    for (asIdx, asTerminals) in asWindows.enumerated() {
-        if asIdx < sortedWinKeys.count {
-            let axKey = sortedWinKeys[asIdx]
-            if let winSurfaces = windowSurfaces[axKey], winSurfaces.count == asTerminals.count {
+    var usedASWindows: Set<Int> = []
+
+    // Match by title: for each AX window, find the AS window with the best title match
+    for (winIdx, winSurfaces) in windowSurfaces {
+        let axTitle = stableWindowTitle(windowTitles[winIdx] ?? "")
+        guard !axTitle.isEmpty else { continue }
+
+        for (asIdx, asWin) in asWindows.enumerated() {
+            guard !usedASWindows.contains(asIdx) else { continue }
+            let asTitle = stableWindowTitle(asWin.name)
+            // Match: title contains (spinner-stripped) and terminal count matches surface count
+            if asTitle.contains(axTitle) || axTitle.contains(asTitle),
+               asWin.uuids.count == winSurfaces.count {
+                usedASWindows.insert(asIdx)
                 for (i, s) in winSurfaces.enumerated() {
-                    uuidMap[s.index] = asTerminals[i]
-                }
-                continue
-            }
-        }
-        for key in sortedWinKeys {
-            if let winSurfaces = windowSurfaces[key],
-               winSurfaces.count == asTerminals.count,
-               uuidMap[winSurfaces[0].index] == nil {
-                for (i, s) in winSurfaces.enumerated() {
-                    uuidMap[s.index] = asTerminals[i]
+                    uuidMap[s.index] = asWin.uuids[i]
                 }
                 break
             }
         }
     }
+
+    // Fallback: any unmatched windows, try count-based matching (legacy behavior)
+    let unmatchedAX = windowSurfaces.keys.filter { winIdx in
+        windowSurfaces[winIdx]?.first.map({ uuidMap[$0.index] == nil }) ?? false
+    }
+    for winIdx in unmatchedAX {
+        guard let winSurfaces = windowSurfaces[winIdx] else { continue }
+        for (asIdx, asWin) in asWindows.enumerated() {
+            guard !usedASWindows.contains(asIdx),
+                  asWin.uuids.count == winSurfaces.count else { continue }
+            usedASWindows.insert(asIdx)
+            for (i, s) in winSurfaces.enumerated() {
+                uuidMap[s.index] = asWin.uuids[i]
+            }
+            break
+        }
+    }
+
     return uuidMap
 }
 
@@ -1220,7 +1277,7 @@ if let idx = rawArgs.firstIndex(of: "--window") {
 
 let args = rawArgs
 if args.first == "--version" || args.first == "-V" {
-    print("gx 1.3.0")
+    print("gx 1.3.1")
     exit(0)
 }
 guard let cmd = args.first, cmd != "help" && cmd != "--help" && cmd != "-h" else {
