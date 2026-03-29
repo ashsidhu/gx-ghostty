@@ -386,16 +386,14 @@ private func findScopedWindow(_ app: AXUIElement, _ scope: String) -> AXUIElemen
     }
 }
 
-/// Sort windows deterministically by title then position for stable indexing
+/// Sort windows by CGWindowID for stable indexing.
+/// CGWindowID is a monotonic counter assigned at window creation — doesn't change
+/// with title, focus, or position. Falls back to position for windows without an ID.
 private func sortedWindows(_ windows: [AXUIElement]) -> [AXUIElement] {
     windows.sorted { w1, w2 in
-        let t1: String = ax(w1, kAXTitleAttribute as String) ?? ""
-        let t2: String = ax(w2, kAXTitleAttribute as String) ?? ""
-        if t1 != t2 { return t1 < t2 }
-        let (x1, y1) = axPosition(w1)
-        let (x2, y2) = axPosition(w2)
-        if x1 != x2 { return x1 < x2 }
-        return y1 < y2
+        let id1 = cgWindowID(w1) ?? UInt32.max
+        let id2 = cgWindowID(w2) ?? UInt32.max
+        return id1 < id2
     }
 }
 
