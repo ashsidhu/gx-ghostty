@@ -19,16 +19,11 @@ jobs:
     runs-on: macos-14
     env:
       RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
-      CLANG_MODULE_CACHE_PATH: ${{ runner.temp }}/clang-module-cache
-      SWIFT_MODULECACHE_PATH: ${{ runner.temp }}/swift-module-cache
     steps:
       - name: Check out source
         uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
-
-      - name: Prepare build cache directories
-        run: mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULECACHE_PATH"
 
       - name: Build arm64 binary
         run: swiftc -O gx.swift -o gx-arm64 -framework Cocoa -target arm64-apple-macos14.0
