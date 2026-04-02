@@ -31,7 +31,7 @@ cp gx ~/.local/bin/   # or anywhere on your PATH
 ### 3. it2 shim — optional, for Claude Code teammates
 
 ```bash
-ln -sf "$(pwd)/gx-ghostty/it2" ~/.local/bin/it2
+ln -sf "$(pwd)/gx-ghostty/tools/it2" ~/.local/bin/it2
 ```
 
 Add to `~/.zshrc`:

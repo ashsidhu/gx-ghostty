@@ -24,8 +24,8 @@ Claude Code's ITermBackend detects `ITERM_SESSION_ID` and calls `it2 session {li
 
 ```bash
 # Install (from repo root)
-chmod +x it2
-ln -sf "$(pwd)/it2" ~/.local/bin/it2
+chmod +x tools/it2
+ln -sf "$(pwd)/tools/it2" ~/.local/bin/it2
 
 # ~/.zshrc (captures terminal UUID at shell startup)
 if [[ "$TERM_PROGRAM" == "ghostty" ]]; then
