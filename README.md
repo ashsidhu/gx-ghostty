@@ -172,11 +172,11 @@ Every surface gets a numeric index, a stable window ID, and a Ghostty terminal U
 
 ### Scoping
 
-By default, gx only sees the focused window.
+By default, gx scopes to the focused window. UUIDs and window IDs (`wNNNNN`) automatically search across all windows — they're globally unique, so scoping doesn't apply.
 
 | Flag | Effect |
 |---|---|
-| `--all` | Operate across all Ghostty windows |
+| `--all` | List/target across all Ghostty windows (needed for cross-window index and title targeting) |
 | `--window <n\|title>` | Scope to a specific window by index or title |
 | `GX_WINDOW=<n\|title>` | Same as `--window`, via environment variable |
 
@@ -268,7 +268,7 @@ Everything else (list, send, split, close, peek) is general-purpose terminal scr
 
 ### AX↔AppleScript correlation
 
-`gx list` needs both AX data (index, active state, pane positions) and AppleScript data (UUIDs). Correlated by `asAllWindowTerminals()` — one AS call enumerates every window's terminal UUIDs in order, matched to AX surfaces by ordinal window position + terminal count. No title matching (avoids spinner rotation + focused-pane title shift).
+`gx list` needs both AX data (index, active state, pane positions) and AppleScript data (UUIDs). Correlated by `asAllWindowTabTerminals()` — one AS call enumerates every window's terminal UUIDs grouped per-tab, then walked in parallel with AX surfaces. Split panes consume consecutive UUIDs from the same AS tab; inactive tabs map 1:1. Matching uses ordinal window position (not titles), avoiding spinner rotation and focused-pane title shift.
 
 ### Stable window IDs
 

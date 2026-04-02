@@ -90,7 +90,7 @@ All target types resolve to UUID via `resolveToUUID` before hitting the AS path.
 | Numeric index | `gx peek 0 10` | Reshuffles on title change |
 | Title substring | `gx peek "myproject" 10` | First match wins |
 
-**Prefer UUIDs for automation.** `--all` required for cross-window operations.
+**Prefer UUIDs for automation.** UUIDs and window IDs (`wNNNNN`) work cross-window without `--all`. Use `--all` for cross-window `list` and index/title targeting.
 
 ## Peek Ranges
 
