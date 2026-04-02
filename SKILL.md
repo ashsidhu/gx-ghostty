@@ -7,9 +7,9 @@ description: Use when interacting with Ghostty terminals — listing, peeking, s
 
 Thinnest possible scripting layer on top of Ghostty. Exists to close the loop until Ghostty ships these primitives natively.
 
-Version: 1.3.2
-Source: `~/scratch/gx/gx.swift`
-Binary: `~/.local/bin/gx` → `~/scratch/gx/gx`
+Version: 1.3.3
+Source: `gx.swift`
+Binary: Build with `swiftc -O gx.swift -o gx -framework Cocoa`, then place `gx` on your PATH.
 Requires: Accessibility permission + Ghostty 1.3+
 
 ## Build

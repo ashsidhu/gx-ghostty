@@ -1411,7 +1411,7 @@ if let idx = rawArgs.firstIndex(of: "--window") {
 
 let args = rawArgs
 if args.first == "--version" || args.first == "-V" {
-    print("gx 1.3.2")
+    print("gx 1.3.3")
     exit(0)
 }
 guard let cmd = args.first, cmd != "help" && cmd != "--help" && cmd != "-h" else {
