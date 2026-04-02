@@ -97,19 +97,50 @@ private func asListTerminals() -> [(uuid: String, name: String)] {
 /// No title matching — pure ordinal, avoids spinner/focus title-shift issues.
 /// Returns [(windowName, [terminalUUIDs])] — one entry per window, terminals across ALL tabs.
 private func asAllWindowTerminals() -> [(name: String, uuids: [String])] {
+    // Flatten the per-tab structure into per-window for backward compat
+    return asAllWindowTabTerminals().map { win in
+        (name: win.name, uuids: win.tabs.flatMap { $0 })
+    }
+}
+
+/// Terminal UUIDs grouped by tab within each window.
+struct ASWindowTabs {
+    let name: String
+    let tabs: [[String]]         // tabs[tabIndex] = [uuid, ...] (splits within tab)
+    let selectedTabIndex: Int    // 0-based index of the selected/active tab
+}
+
+/// Get all windows' terminal UUIDs, grouped by tab within each window.
+/// Returns one entry per window, with terminals organized per-tab.
+/// This is essential for split pane UUID resolution — splits share a tab,
+/// so we need per-tab grouping rather than per-window flattening.
+private func asAllWindowTabTerminals() -> [ASWindowTabs] {
     guard let result = runAS("""
         tell application "Ghostty"
             set output to ""
             repeat with w in every window
                 set wName to name of w
                 set output to output & wName & "\\t"
-                set allTerms to {}
+                -- Find selected tab index (0-based)
+                set selIdx to 0
+                set tabIdx to 0
                 repeat with t in every tab of w
-                    set allTerms to allTerms & (id of every terminal of t)
+                    try
+                        if selected of t then set selIdx to tabIdx
+                    end try
+                    set tabIdx to tabIdx + 1
                 end repeat
-                repeat with i from 1 to count of allTerms
-                    set output to output & item i of allTerms
-                    if i < count of allTerms then set output to output & ","
+                set output to output & (selIdx as text) & "\\t"
+                -- Enumerate terminals per tab, separated by |
+                set tabCount to 0
+                repeat with t in every tab of w
+                    if tabCount > 0 then set output to output & "|"
+                    set tIds to id of every terminal of t
+                    repeat with i from 1 to count of tIds
+                        if i > 1 then set output to output & ","
+                        set output to output & item i of tIds
+                    end repeat
+                    set tabCount to tabCount + 1
                 end repeat
                 set output to output & "\\n"
             end repeat
@@ -117,13 +148,18 @@ private func asAllWindowTerminals() -> [(name: String, uuids: [String])] {
         end tell
     """), !result.isEmpty else { return [] }
 
-    // Parse "windowName\tuuid1,uuid2\nwindowName2\tuuid3\n..." into [(name, [uuid])]
+    // Parse "windowName\tselIdx\tuuid1,uuid2|uuid3\n..." into [ASWindowTabs]
     return result.components(separatedBy: "\n")
         .filter { !$0.isEmpty }
         .compactMap { line in
             let parts = line.components(separatedBy: "\t")
-            guard parts.count == 2, !parts[1].isEmpty else { return nil }
-            return (name: parts[0], uuids: parts[1].components(separatedBy: ","))
+            guard parts.count == 3 else { return nil }
+            let name = parts[0]
+            let selIdx = Int(parts[1]) ?? 0
+            let tabs = parts[2].components(separatedBy: "|").map { tabStr in
+                tabStr.isEmpty ? [String]() : tabStr.components(separatedBy: ",")
+            }
+            return ASWindowTabs(name: name, tabs: tabs, selectedTabIndex: selIdx)
         }
 }
 
@@ -556,7 +592,7 @@ private func resolveUUID(_ uuid: String, pid: pid_t, surfaces: [Surface]) -> Sur
     // This handles the common case (each window has a unique pane count) robustly.
     let zeroPos = posInWin - 1
 
-    // Try ordinal match first (AS window N → AX window N)
+    // Try ordinal match first (AS window N → AX window N) with count verification
     if asWinIdx - 1 < sortedWindowKeys.count {
         let axKey = sortedWindowKeys[asWinIdx - 1]
         if let winSurfaces = windowSurfaces[axKey],
@@ -566,7 +602,7 @@ private func resolveUUID(_ uuid: String, pid: pid_t, surfaces: [Surface]) -> Sur
         }
     }
 
-    // Fallback: find any AX window with matching terminal count
+    // Fallback 1: find any AX window with matching terminal count at the right position
     for key in sortedWindowKeys {
         if let winSurfaces = windowSurfaces[key],
            winSurfaces.count == totalTerminals,
@@ -575,7 +611,31 @@ private func resolveUUID(_ uuid: String, pid: pid_t, surfaces: [Surface]) -> Sur
         }
     }
 
+    // Fallback 2: ordinal match without count verification.
+    // AX may report fewer surfaces than AS terminals (e.g. inactive tab panes are
+    // not in the AX tree). Trust the ordinal and use position if in bounds.
+    if asWinIdx - 1 < sortedWindowKeys.count {
+        let axKey = sortedWindowKeys[asWinIdx - 1]
+        if let winSurfaces = windowSurfaces[axKey],
+           zeroPos < winSurfaces.count {
+            return winSurfaces[zeroPos]
+        }
+    }
+
     return nil
+}
+
+/// Find surfaces across all windows (scope-independent).
+/// Used by resolution functions that need to search globally.
+private func findAllSurfaces() -> (pid_t, [Surface])? {
+    let savedScope = scopeAllWindows
+    let savedWindow = windowScope
+    scopeAllWindows = true
+    windowScope = nil
+    let result = findSurfaces()
+    scopeAllWindows = savedScope
+    windowScope = savedWindow
+    return result
 }
 
 private func resolveSurface(_ id: String) -> (pid_t, Surface)? {
@@ -591,8 +651,9 @@ private func resolveSurface(_ id: String) -> (pid_t, Surface)? {
     }
 
     // UUID: Ghostty terminal UUID (from AppleScript split)
+    // Always search all windows — UUIDs are globally unique.
     if isUUID(id) {
-        guard let (pid, surfaces) = findSurfaces() else { return nil }
+        guard let (pid, surfaces) = findAllSurfaces() else { return nil }
         if let match = resolveUUID(id, pid: pid, surfaces: surfaces) {
             return (pid, match)
         }
@@ -601,6 +662,7 @@ private func resolveSurface(_ id: String) -> (pid_t, Surface)? {
         return nil
     }
 
+    // Try scoped surfaces first, then fall back to all windows
     guard let (pid, surfaces) = findSurfaces() else { return nil }
 
     // Stable window ID: w<CGWindowID> (e.g. "w1234")
@@ -608,24 +670,38 @@ private func resolveSurface(_ id: String) -> (pid_t, Surface)? {
         if let match = surfaces.first(where: { $0.windowID == wid }) {
             return (pid, match)
         }
+        // Fall back to all windows for cross-window targeting
+        if let (pid2, allSurfaces) = findAllSurfaces(),
+           let match = allSurfaces.first(where: { $0.windowID == wid }) {
+            return (pid2, match)
+        }
         fputs("error: no surface with window ID \(wid)\n", stderr)
-        fputs("hint: re-run 'gx \(scopeAllWindows ? "--all " : "")list' to see current IDs\n", stderr)
+        fputs("hint: re-run 'gx --all list' to see current IDs\n", stderr)
         return nil
     }
 
-    // Numeric index
+    // Numeric index — try scoped first, then all windows
     if let idx = Int(id) {
         if idx >= 0 && idx < surfaces.count {
             return (pid, surfaces[idx])
         }
-        fputs("error: surface index \(idx) out of range (found \(surfaces.count) surfaces)\n", stderr)
-        fputs("hint: re-run 'gx \(scopeAllWindows ? "--all " : "")list' to see current indices\n", stderr)
+        // Fall back to all-window index space
+        if let (pid2, allSurfaces) = findAllSurfaces(),
+           idx >= 0 && idx < allSurfaces.count {
+            return (pid2, allSurfaces[idx])
+        }
+        fputs("error: surface index \(idx) out of range\n", stderr)
+        fputs("hint: re-run 'gx --all list' to see current indices\n", stderr)
         return nil
     }
 
-    // Title substring match
+    // Title substring match — try scoped first, then all windows
     if let match = surfaces.first(where: { $0.displayTitle.localizedCaseInsensitiveContains(id) }) {
         return (pid, match)
+    }
+    if let (pid2, allSurfaces) = findAllSurfaces(),
+       let match = allSurfaces.first(where: { $0.displayTitle.localizedCaseInsensitiveContains(id) }) {
+        return (pid2, match)
     }
 
     fputs("error: surface '\(id)' not found\n", stderr)
@@ -850,62 +926,56 @@ private func stableWindowTitle(_ title: String) -> String {
     String(title.drop(while: { !$0.isASCII || $0.isWhitespace }).drop(while: { $0.isWhitespace }))
 }
 
-/// Build a map from surface index → terminal UUID using window-name correlation.
-/// Matches AX windows to AS windows by title (stripping spinner prefixes),
-/// then assigns UUIDs by surface order within each window.
+/// Build a map from surface index → terminal UUID using tab-aware ordinal correlation.
+/// Matches AX windows to AS windows by ordinal position, then walks AX surfaces and
+/// AS tabs in parallel — the same algorithm as surfaceToUUID but for all surfaces at once.
+///
+/// Key insight: inactive tabs with splits show as 1 AX surface but N AS terminals.
+/// The flat count (total AS terminals in a window) won't match the AX surface count
+/// when any inactive tab has splits. Using per-tab grouping avoids this mismatch.
 private func buildUUIDMap(surfaces: [Surface]) -> [Int: String] {
-    let asWindows = asAllWindowTerminals()
+    let asWindows = asAllWindowTabTerminals()
 
     // Group surfaces by windowIndex
     var windowSurfaces: [Int: [Surface]] = [:]
     for s in surfaces { windowSurfaces[s.windowIndex, default: []].append(s) }
-
-    // Get the AX window title for each window group (from the first surface or the window element)
-    var windowTitles: [Int: String] = [:]
-    for (winIdx, winSurfaces) in windowSurfaces {
-        if let firstSurface = winSurfaces.first {
-            let axTitle: String = ax(firstSurface.window, kAXTitleAttribute as String) ?? ""
-            windowTitles[winIdx] = axTitle
-        }
-    }
+    let sortedWindowKeys = windowSurfaces.keys.sorted()
 
     var uuidMap: [Int: String] = [:]
-    var usedASWindows: Set<Int> = []
 
-    // Match by title: for each AX window, find the AS window with the best title match
-    for (winIdx, winSurfaces) in windowSurfaces {
-        let axTitle = stableWindowTitle(windowTitles[winIdx] ?? "")
-        guard !axTitle.isEmpty else { continue }
+    for (ordinal, winIdx) in sortedWindowKeys.enumerated() {
+        guard ordinal < asWindows.count else { break }
+        let winSurfaces = windowSurfaces[winIdx]!
+        let asWin = asWindows[ordinal]
 
-        for (asIdx, asWin) in asWindows.enumerated() {
-            guard !usedASWindows.contains(asIdx) else { continue }
-            let asTitle = stableWindowTitle(asWin.name)
-            // Match: title contains (spinner-stripped) and terminal count matches surface count
-            if asTitle.contains(axTitle) || axTitle.contains(asTitle),
-               asWin.uuids.count == winSurfaces.count {
-                usedASWindows.insert(asIdx)
-                for (i, s) in winSurfaces.enumerated() {
-                    uuidMap[s.index] = asWin.uuids[i]
+        // Walk AX surfaces and AS tabs in parallel.
+        // Split panes map to consecutive UUIDs within the same AS tab.
+        // Regular (non-split) surfaces map to the first UUID in their AS tab.
+        var asTabIdx = 0
+        var i = 0
+        while i < winSurfaces.count && asTabIdx < asWin.tabs.count {
+            let s = winSurfaces[i]
+            let asTab = asWin.tabs[asTabIdx]
+
+            if case .splitPane = s.kind {
+                var paneOffset = 0
+                while i < winSurfaces.count {
+                    let ps = winSurfaces[i]
+                    guard case .splitPane = ps.kind else { break }
+                    if paneOffset < asTab.count {
+                        uuidMap[ps.index] = asTab[paneOffset]
+                    }
+                    paneOffset += 1
+                    i += 1
                 }
-                break
+                asTabIdx += 1
+            } else {
+                if !asTab.isEmpty {
+                    uuidMap[s.index] = asTab[0]
+                }
+                i += 1
+                asTabIdx += 1
             }
-        }
-    }
-
-    // Fallback: any unmatched windows, try count-based matching (legacy behavior)
-    let unmatchedAX = windowSurfaces.keys.filter { winIdx in
-        windowSurfaces[winIdx]?.first.map({ uuidMap[$0.index] == nil }) ?? false
-    }
-    for winIdx in unmatchedAX {
-        guard let winSurfaces = windowSurfaces[winIdx] else { continue }
-        for (asIdx, asWin) in asWindows.enumerated() {
-            guard !usedASWindows.contains(asIdx),
-                  asWin.uuids.count == winSurfaces.count else { continue }
-            usedASWindows.insert(asIdx)
-            for (i, s) in winSurfaces.enumerated() {
-                uuidMap[s.index] = asWin.uuids[i]
-            }
-            break
         }
     }
 
@@ -913,31 +983,121 @@ private func buildUUIDMap(surfaces: [Surface]) -> [Int: String] {
 }
 
 /// Resolve any target ID to a Ghostty terminal UUID.
-/// Always searches all windows — UUID resolution is scope-independent.
+/// Uses the same resolution path as resolveSurface, then maps the AX surface
+/// to a UUID via positional AS matching (not title-based buildUUIDMap).
 private func resolveToUUID(_ id: String) -> String? {
     if isUUID(id) { return id }
     if id == "focused" { return asFocusedTerminalUUID() }
 
-    // Search all windows regardless of --all/--window flags
-    let savedScope = scopeAllWindows
-    let savedWindow = windowScope
-    scopeAllWindows = true
-    windowScope = nil
-    let result = findSurfaces()
-    scopeAllWindows = savedScope
-    windowScope = savedWindow
+    // Use resolveSurface to find the AX surface (handles all ID types uniformly)
+    guard let (_, surface) = resolveSurface(id) else { return nil }
 
-    guard let (_, surfaces) = result else { return nil }
-    let surface: Surface?
-    if id.hasPrefix("w"), let wid = UInt32(id.dropFirst()) {
-        surface = surfaces.first(where: { $0.windowID == wid })
-    } else if let idx = Int(id), idx >= 0, idx < surfaces.count {
-        surface = surfaces[idx]
-    } else {
-        surface = surfaces.first(where: { $0.displayTitle.localizedCaseInsensitiveContains(id) })
+    // Now map AX surface → UUID using positional matching within the window.
+    // Ask AS for all terminals in every window, then find which window this
+    // surface belongs to by matching windowIndex to AS window order, and use
+    // the surface's position within its window group.
+    return surfaceToUUID(surface)
+}
+
+/// Map an AX surface to a Ghostty terminal UUID using positional AS matching.
+/// Groups surfaces by window, finds the AS window with matching terminal count
+/// at the same ordinal position, and returns the UUID at the surface's offset.
+private func surfaceToUUID(_ surface: Surface) -> String? {
+    guard let (_, allSurfaces) = findAllSurfaces() else { return nil }
+
+    // Group all AX surfaces by windowIndex (from the all-windows enumeration)
+    var windowSurfaces: [Int: [Surface]] = [:]
+    for s in allSurfaces { windowSurfaces[s.windowIndex, default: []].append(s) }
+    let sortedWindowKeys = windowSurfaces.keys.sorted()
+
+    // Find which window the target surface belongs to in the all-windows enumeration.
+    // We can't use surface.windowIndex directly because the surface may have been
+    // created by a scoped findSurfaces() call (e.g. focused-window only) where
+    // windowIndex=0 always, but in the all-windows view the same window could be
+    // at a different ordinal. Match by CGWindowID for stable identity.
+    let targetWID = surface.windowID
+    var matchedWindowKey: Int? = nil
+    if let wid = targetWID {
+        for key in sortedWindowKeys {
+            if let ws = windowSurfaces[key], ws.first?.windowID == wid {
+                matchedWindowKey = key
+                break
+            }
+        }
     }
-    guard let surface = surface else { return nil }
-    return buildUUIDMap(surfaces: surfaces)[surface.index]
+    // Fallback: if no windowID, try matching by AXUIElement identity
+    if matchedWindowKey == nil {
+        for key in sortedWindowKeys {
+            if let ws = windowSurfaces[key],
+               ws.contains(where: { CFEqual($0.window, surface.window) }) {
+                matchedWindowKey = key
+                break
+            }
+        }
+    }
+
+    guard let winKey = matchedWindowKey,
+          let winSurfaces = windowSurfaces[winKey],
+          let axWindowOrdinal = sortedWindowKeys.firstIndex(of: winKey) else { return nil }
+
+    let asWindows = asAllWindowTabTerminals()
+    guard axWindowOrdinal < asWindows.count else { return nil }
+    let asWin = asWindows[axWindowOrdinal]
+
+    // Walk AX surfaces and AS tabs in parallel to build the mapping.
+    // AX ordering for a tabbed window: inactive tabs = 1 surface each,
+    // active tab = N surfaces (one per split pane). AS tabs enumerate
+    // all terminals per tab regardless of visibility.
+    //
+    // Strategy: iterate AX surfaces in order. For each, consume one AS tab.
+    // If the AX surface is a split pane, all consecutive split pane surfaces
+    // belong to the same AS tab — consume them together, then advance AS tab.
+    //
+    // Surface matching uses AXUIElement identity (not index) because the target
+    // surface may have been created by a scoped enumeration with different indices.
+    var asTabIdx = 0
+    var i = 0
+    while i < winSurfaces.count && asTabIdx < asWin.tabs.count {
+        let s = winSurfaces[i]
+        let asTab = asWin.tabs[asTabIdx]
+
+        if case .splitPane = s.kind {
+            var paneOffset = 0
+            while i < winSurfaces.count {
+                let ps = winSurfaces[i]
+                guard case .splitPane = ps.kind else { break }
+                if sameSurface(ps, surface), paneOffset < asTab.count {
+                    return asTab[paneOffset]
+                }
+                paneOffset += 1
+                i += 1
+            }
+            asTabIdx += 1
+        } else {
+            if sameSurface(s, surface), !asTab.isEmpty {
+                return asTab[0]
+            }
+            i += 1
+            asTabIdx += 1
+        }
+    }
+
+    return nil
+}
+
+/// Check if two Surface structs refer to the same terminal by AXUIElement identity.
+/// Uses textArea for active surfaces (splits, active tabs) and tabButton for inactive tabs.
+private func sameSurface(_ a: Surface, _ b: Surface) -> Bool {
+    // For active surfaces: match by textArea AXUIElement identity
+    if let ta1 = a.textArea, let ta2 = b.textArea {
+        return CFEqual(ta1, ta2)
+    }
+    // For inactive tabs: match by tabButton AXUIElement identity
+    if let tb1 = a.tabButton, let tb2 = b.tabButton {
+        return CFEqual(tb1, tb2)
+    }
+    // Fallback: match by window + title + kind (less reliable but handles edge cases)
+    return CFEqual(a.window, b.window) && a.title == b.title && a.displayTitle == b.displayTitle
 }
 
 // MARK: - Commands
@@ -1131,18 +1291,20 @@ private func cmdNewTab(_ cwd: String?) {
 }
 
 private func cmdClose(_ id: String) {
-    // Try AppleScript path for UUIDs
+    // Try AppleScript close first (works cross-window, no focus needed)
+    let uuid: String?
     if isUUID(id) {
-        if asCloseTerminal(id) {
-            print("closed \(id)")
-            return
-        }
-        // Terminal might already be gone — that's OK (idempotent)
+        uuid = id
+    } else {
+        uuid = resolveToUUID(id)
+    }
+    if let uuid = uuid {
+        _ = asCloseTerminal(uuid)
         print("closed \(id)")
         return
     }
 
-    // AX fallback: focus + Cmd+W
+    // AX fallback: focus + Cmd+W (only when UUID resolution fails entirely)
     guard let (pid, surface) = resolveSurface(id) else { exit(1) }
     withFocus(pid, surface) {
         postKey(pid, kVK_ANSI_W, .maskCommand)
@@ -1153,34 +1315,8 @@ private func cmdClose(_ id: String) {
 private func cmdSplit(_ id: String, vertical: Bool) {
     let direction = vertical ? "down" : "right"
 
-    // Determine target UUID
-    var targetUUID: String?
-    if id == "focused" {
-        targetUUID = asFocusedTerminalUUID()
-    } else if isUUID(id) {
-        targetUUID = id
-    } else {
-        // Resolve AX surface, then correlate to UUID using positional matching
-        guard let (_, surfaces) = findSurfaces() else { exit(1) }
-        guard let surface = (Int(id).flatMap({ idx in idx >= 0 && idx < surfaces.count ? surfaces[idx] : nil })
-            ?? surfaces.first(where: { id.hasPrefix("w") ? $0.windowID.map({ "w\($0)" }) == id : false })
-            ?? surfaces.first(where: { $0.displayTitle.localizedCaseInsensitiveContains(id) })) else {
-            fputs("error: surface '\(id)' not found\n", stderr)
-            exit(1)
-        }
-
-        // Group surfaces by window and find this surface's position within its window
-        let winTitle: String = ax(surface.window, kAXTitleAttribute as String) ?? ""
-        let winSurfaces = surfaces.filter { ax($0.window, kAXTitleAttribute as String) as String? == winTitle }
-        let posInWindow = winSurfaces.firstIndex(where: { $0.index == surface.index }) ?? 0
-        let uuids = asTerminalsForWindow(title: winTitle)
-
-        if posInWindow < uuids.count {
-            targetUUID = uuids[posInWindow]
-        }
-    }
-
-    guard let uuid = targetUUID else {
+    // Use unified resolution — works for UUID, index, title, window ID, and "focused"
+    guard let uuid = resolveToUUID(id) else {
         fputs("error: could not resolve target '\(id)' to a Ghostty terminal UUID\n", stderr)
         fputs("hint: ensure Ghostty 1.3+ with AppleScript enabled\n", stderr)
         exit(1)
@@ -1319,7 +1455,8 @@ guard let cmd = args.first, cmd != "help" && cmd != "--help" && cmd != "-h" else
     ID: numeric index, title substring, wNNNNN (window ID), UUID, or "focused".
     [AS] = uses Ghostty AppleScript API (1.3+), stable UUID targeting.
     All commands restore your active tab after acting on another.
-    Scoped to current window by default. Use --all for cross-window operations.
+    Scoped to current window by default. Use --all for cross-window list.
+    UUIDs and window IDs (wNNNNN) work cross-window without --all.
     """)
     exit(0)
 }
